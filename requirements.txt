@@ -1,0 +1,14 @@
+# runtime
+
+numpy
+pillow
+rawkit
+opencv-contrib-python
+imreg_dft
+
+
+
+# development
+matplotlib
+pytest
+ipython
