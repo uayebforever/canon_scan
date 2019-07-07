@@ -1,4 +1,6 @@
 
+from typing import List, Dict
+
 # Python Standard Library Imports
 import os
 
@@ -18,7 +20,7 @@ def display_histogram(filename):
         with Image.open(filename) as im:
             im_data = np.array(im)
 
-            pyplot.hist(im_data.flat, bins=256)
+            pyplot.hist(im_data.flat, bins=range(0, 255))
 
         return im_data
 
@@ -68,8 +70,9 @@ class CanonImage:
 
     @calibrated_image_data.setter
     def calibrated_image_data(self, value):
-        self._calibrated_image_data = value
-        self.calibrated_image = Image.fromarray(self._calibrated_image_data.astype('uint8'))
+        if value is not None:
+            self._calibrated_image_data = value
+            self.calibrated_image = Image.fromarray(self._calibrated_image_data.astype('uint8'))
 
     def save(self):
 
@@ -81,10 +84,20 @@ class CanonImage:
 
 class CalibrationSet:
 
+    chess_board_rows = 7
+    chess_board_cols = 9
+
     def __init__(self):
         self._flatfield_data = None
 
         self.calibrated_image_data = None  # type: np.ndarray
+
+        self.distortion_measurement_filenames = []  # type: List[str]
+        self.distortion_measurement_data = dict()  # type: Dict[str, np.ndarray]
+
+        self.perspective_transform = None
+
+        self._undistort_maps = None
 
     def load_flatfield(self, canon_image):
         # type: (CanonImage) -> None
@@ -101,41 +114,185 @@ class CalibrationSet:
 
         self._flatfield_data = value/np.mean(value)
 
-    def calibrate_flatfield(self, image):
+
+    def measure_distortion(self, save="camera_distortion_model.npz"):
+        # termination criteria
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+        # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
+        objp = np.zeros((self.chess_board_rows * self.chess_board_cols, 3), np.float32)
+        objp[:, :2] = np.mgrid[0:self.chess_board_rows, 0:self.chess_board_cols].T.reshape(-1, 2)
+
+        # Arrays to store object points and image points from all the images.
+        objpoints = []  # 3d point in real world space
+        imgpoints = []  # 2d points in image plane.
+
+        images = map("IMG_{0:04d}.JPG".format, range(25, 42))
+
+        gray = None
+        img = None
+
+        for fname in self.distortion_measurement_filenames:
+            print("Proccessing image %s" % fname)
+            img = cv2.imread(fname)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Find the chess board corners
+            ret, corners = cv2.findChessboardCorners(gray, (self.chess_board_rows, self.chess_board_cols), None)
+
+            # If found, add object points, image points (after refining them)
+            if ret:
+                print("   found %s points" % str(len(objp)))
+                objpoints.append(objp)
+
+                corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                imgpoints.append(corners2)
+
+                # Draw and display the corners
+                # img = cv2.drawChessboardCorners(img, (7, 6), corners2, ret)
+                # cv2.imshow('img', img)
+                # cv2.waitKey(500)
+            else:
+                print("   no points found.")
+
+        # cv2.destroyAllWindows()
+
+        assert isinstance(gray, np.ndarray), isinstance(img, np.ndarray)
+
+        ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+
+        # img = cv2.imread('IMG_0035.JPG')
+        h, w = img.shape[:2]
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, imageSize=(w, h), alpha=0, newImgSize=(w, h))
+
+        self.distortion_measurement_data = {
+            'input_camera_matrix': mtx,
+            'distortion_coefficients': dist,
+            'new_camera_matrix': newcameramtx,
+            'roi': roi
+        }
+        if save:
+            np.savez(save, **self.distortion_measurement_data)
+
+    def load_distortion_measurement_data(self, filename):
+        # type: (str) -> None
+
+        self.distortion_measurement_data = np.load(filename)
+
+
+    def measure_perspecitve(self, image):
         # type: (CanonImage) -> None
 
-        image.calibrated_image_data = image.grayscale_data / self._flatfield_data
+        # Correct for distortion:
 
-    def calibrate_distortion(self, image):
+        dst = self.calibrate_distortion(image, 'grayscale_data')
 
-        height, width = image.grayscale_data.shape
+        # Get image size
+        height, width = dst.shape[:2]
 
-        distCoeff = np.zeros((4, 1), np.float64)
+        # Find the chess board corners
+        ret, corners = cv2.findChessboardCorners(dst, (self.chess_board_rows, self.chess_board_cols), None)
+        # corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
-        distCoeff[0, 0] = -5.0e-6  # k1 (negative to remove barrel distortion)
-        distCoeff[1, 0] = 0.0  # k2
-        distCoeff[2, 0] = 0.0  # p1
-        distCoeff[3, 0] = 0.0  # p2
+        # Find corners of grid
+        corner_indexes = [np.linalg.norm(corners, axis=2).argmin(),  # Bottom Left
+                          np.linalg.norm(corners, axis=2).argmax(),  # Top Right
+                          np.linalg.norm(corners + np.array([[[-width, 0]]]), axis=2).argmin(),  # Bottom Right
+                          np.linalg.norm(corners + np.array([[[-width, 0]]]), axis=2).argmax()]  # Top left
+        assert len(np.unique(np.array(corner_indexes))) == 4
 
-        # assume unit matrix for camera
-        cam = np.eye(3, dtype=np.float32)
+        bl, tr, br, tl = corners[corner_indexes, 0]
 
-        cam[0, 2] = width / 2.0  # define center x
-        cam[1, 2] = height / 2.0  # define center y
-        cam[0, 0] = 50.  # define focal length x
-        cam[1, 1] = 50.  # define focal length y
+        chess_board_ratio = (self.chess_board_cols - 1) / (self.chess_board_rows - 1)
 
-        # here the undistortion will be computed
-        image.grayscale_data = cv2.undistort(image.grayscale_data, cam, distCoeff)
+        # Take two left corners, and compute new right corners.
+        offset = np.array([chess_board_ratio * ((tl - bl)[1]), -chess_board_ratio * ((tl - bl)[0])])
+        new_br = bl + offset
+        new_tr = tl + offset
+
+        self.perspective_transform = cv2.getPerspectiveTransform(corners[corner_indexes, 0, :],
+                                                            np.array([bl, new_tr, new_br, tl], dtype=np.float32))
+
+
+
+    def calibrate_flatfield(self, image, source='grayscale_data'):
+        # type: (CanonImage, str) -> np.ndarray
+
+        source_data = getattr(image, source)
+
+        return source_data / self._flatfield_data
+
+    def calibrate_distortion(self, image, source='calibrated_image_data', method='simple'):
+        # type: (CanonImage, str, str) -> np.ndarray
+
+        source_data = getattr(image, source)
+
+        height, width = source_data.shape
+
+        if method == "calculate":
+
+            # Calculate and cache un-distortion maps
+            if self._undistort_maps is None:
+                self._undistort_maps = cv2.initUndistortRectifyMap(
+                    self.distortion_measurement_data['input_camera_matrix'],
+                    self.distortion_measurement_data['distortion_coefficients'],
+                    None,
+                    self.distortion_measurement_data['new_camera_matrix'], (width, height), 5)
+
+            # Remap the image data
+            undist_image_data = cv2.remap(source_data, self._undistort_maps[0], self._undistort_maps[1], cv2.INTER_LINEAR)
+
+            # crop the image
+            x, y, w, h = self.distortion_measurement_data['roi']
+            undist_image_data = undist_image_data[y:y + h, x:x + w]
+
+            return undist_image_data
+
+        else:
+            distCoeff = np.zeros((4, 1), np.float64)
+
+            distCoeff[0, 0] = -5.0e-6  # k1 (negative to remove barrel distortion)
+            distCoeff[1, 0] = 0.0  # k2
+            distCoeff[2, 0] = 0.0  # p1
+            distCoeff[3, 0] = 0.0  # p2
+
+            # assume unit matrix for camera
+            cam = np.eye(3, dtype=np.float32)
+
+            cam[0, 2] = width / 2.0  # define center x
+            cam[1, 2] = height / 2.0  # define center y
+            cam[0, 0] = 50.  # define focal length x
+            cam[1, 1] = 50.  # define focal length y
+
+            # here the undistortion will be computed
+            return cv2.undistort(source_data, cam, distCoeff)
+
+
+    def calibrate_perspective(self, image, source='calibrated_image_data'):
+        # type: (CanonImage, str) -> np.ndarray
+
+        source_data = getattr(image, source)
+
+        height, width = source_data.shape
+
+        return cv2.warpPerspective(source_data, self.perspective_transform, (width, height))
 
 
 
     def calibrate(self, image):
         # type: (CanonImage) -> None
 
-        self.calibrate_flatfield(image)
+        # Copy the uncalibrated data into the calibrated data, and then run
+        # the various calibrations. Each calibration will run on the data
+        # in the calibrated attribute, progressing the calibration.
 
-        self.calibrate_distortion(image)
+        # image.calibrated_image_data = image.grayscale_data
+
+        image.calibrated_image_data = self.calibrate_flatfield(image)
+
+        image.calibrated_image_data = self.calibrate_distortion(image, method='calculate')
+
+        image.calibrated_image_data = self.calibrate_perspective(image)
 
 # def display_image():
 #
